@@ -1,0 +1,11 @@
+[project]
+name = "Py-LLM-L"
+version = "0.1.0"
+description = "Python program to call a LLM (locally)"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pypdf>=6.10.2",
+    "requests>=2.33.1",
+    "streamlit>=1.56.0",
+]

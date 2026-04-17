@@ -1,0 +1,331 @@
+import streamlit as st
+import subprocess
+import requests
+import json
+import os
+import base64
+import tempfile
+
+# ── Config ──────────────────────────────────────────────────────────────────
+PROMPTS_FILE = "prompts.json"
+SETTINGS_FILE = "settings.json"
+LMS_API_BASE = "http://localhost:1234/v1"   # LM Studio default
+
+DEFAULT_PROMPTS = [
+    "Summarise this document in 3 bullet points.",
+    "List the key action items from this document.",
+    "What are the main risks or concerns mentioned?",
+    "Extract all dates and deadlines mentioned.",
+    "Write an executive summary of this document.",
+]
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def load_prompts():
+    if os.path.exists(PROMPTS_FILE):
+        with open(PROMPTS_FILE) as f:
+            return json.load(f)
+    return DEFAULT_PROMPTS.copy()
+
+def save_prompts(prompts):
+    with open(PROMPTS_FILE, "w") as f:
+        json.dump(prompts, f, indent=2)
+
+def load_settings():
+    if os.path.exists(SETTINGS_FILE):
+        with open(SETTINGS_FILE) as f:
+            return json.load(f)
+    return {"include_full_text": True, "model": "local-model"}
+
+def save_settings(settings):
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump(settings, f, indent=2)
+
+def check_server():
+    try:
+        result = subprocess.run(
+            ["lms", "server", "start"],
+            capture_output=True, text=True, timeout=8,
+            shell=True  # needed on Windows
+        )
+        output = result.stdout + result.stderr
+        running = result.returncode == 0 and "running" in output.lower()
+        return running, output.strip() or "(no output)"
+    except FileNotFoundError:
+        return False, "`lms` command not found. Is LM Studio installed and on PATH?"
+    except subprocess.TimeoutExpired:
+        return False, "Command timed out."
+    except Exception as e:
+        return False, str(e)
+
+def extract_pdf_text(uploaded_file):
+    try:
+        import pypdf
+        reader = pypdf.PdfReader(uploaded_file)
+        return "\n\n".join(page.extract_text() or "" for page in reader.pages)
+    except ImportError:
+        return None, "pypdf not installed. Run: pip install pypdf"
+    except Exception as e:
+        return None, str(e)
+
+def send_to_llm(prompt, pdf_text, model, include_full_text):
+    system = "You are a helpful assistant that analyses documents."
+    if include_full_text and pdf_text:
+        user_msg = f"Here is the document content:\n\n{pdf_text}\n\n---\n\n{prompt}"
+    elif pdf_text:
+        # send a trimmed excerpt
+        excerpt = pdf_text[:3000]
+        user_msg = f"Here is an excerpt from the document:\n\n{excerpt}\n\n---\n\n{prompt}"
+    else:
+        user_msg = prompt
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user_msg},
+        ],
+        "stream": False,
+    }
+    resp = requests.post(f"{LMS_API_BASE}/chat/completions", json=payload, timeout=120)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
+
+# ── Page setup ────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Local LLM Console",
+    page_icon="🤖",
+    layout="wide",
+)
+
+# ── Custom CSS ────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Syne:wght@400;700;800&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'Syne', sans-serif;
+    background: #0d0f14;
+    color: #e2e8f0;
+}
+
+h1, h2, h3 { font-family: 'Syne', sans-serif; font-weight: 800; }
+
+.stButton > button {
+    background: #1e40af;
+    color: #e2e8f0;
+    border: none;
+    border-radius: 6px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.85rem;
+    padding: 0.5rem 1.2rem;
+    transition: background 0.2s;
+}
+.stButton > button:hover { background: #2563eb; }
+
+.stTextArea textarea {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.82rem;
+    background: #111827;
+    color: #a5f3fc;
+    border: 1px solid #1e3a5f;
+    border-radius: 6px;
+}
+
+.response-box {
+    background: #111827;
+    border: 1px solid #1e3a5f;
+    border-radius: 8px;
+    padding: 1.2rem 1.4rem;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.85rem;
+    color: #a5f3fc;
+    white-space: pre-wrap;
+    line-height: 1.7;
+    min-height: 120px;
+}
+
+.status-ok   { color: #4ade80; font-weight: 700; }
+.status-fail { color: #f87171; font-weight: 700; }
+
+.panel-label {
+    font-size: 0.72rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #64748b;
+    margin-bottom: 0.3rem;
+}
+
+div[data-testid="stSelectbox"] label,
+div[data-testid="stFileUploader"] label,
+div[data-testid="stToggle"] label {
+    font-size: 0.78rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #94a3b8;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ── Session state ─────────────────────────────────────────────────────────────
+if "prompts" not in st.session_state:
+    st.session_state.prompts = load_prompts()
+if "settings" not in st.session_state:
+    st.session_state.settings = load_settings()
+if "response" not in st.session_state:
+    st.session_state.response = ""
+if "pdf_text" not in st.session_state:
+    st.session_state.pdf_text = ""
+if "server_status" not in st.session_state:
+    st.session_state.server_status = None   # None = unchecked
+
+# ── Header ────────────────────────────────────────────────────────────────────
+st.markdown("## 🤖 Local LLM Console")
+st.markdown("---")
+
+# ── Layout ────────────────────────────────────────────────────────────────────
+left, right = st.columns([1, 1.6], gap="large")
+
+# ════════════════════════════ LEFT PANEL ════════════════════════════════════
+with left:
+    # ── Server Status ──────────────────────────────────────────────────────
+    st.markdown('<p class="panel-label">Server</p>', unsafe_allow_html=True)
+    col_btn, col_status = st.columns([1, 2])
+    with col_btn:
+        if st.button("Check Status"):
+            with st.spinner("Checking..."):
+                ok, msg = check_server()
+                st.session_state.server_status = (ok, msg)
+    with col_status:
+        if st.session_state.server_status is not None:
+            ok, msg = st.session_state.server_status
+            label = "● ONLINE" if ok else "● OFFLINE"
+            cls   = "status-ok" if ok else "status-fail"
+            st.markdown(f'<span class="{cls}">{label}</span>', unsafe_allow_html=True)
+            with st.expander("Details"):
+                st.code(msg, language="")
+
+    st.markdown("---")
+
+    # ── PDF Upload ─────────────────────────────────────────────────────────
+    st.markdown('<p class="panel-label">PDF Document</p>', unsafe_allow_html=True)
+    uploaded = st.file_uploader("Select a PDF file", type=["pdf"], label_visibility="collapsed")
+    if uploaded:
+        text = extract_pdf_text(uploaded)
+        if isinstance(text, tuple):          # error tuple
+            st.error(text[1])
+            st.session_state.pdf_text = ""
+        else:
+            st.session_state.pdf_text = text
+            st.success(f"Loaded **{uploaded.name}** — {len(text):,} chars / ~{len(text)//4:,} tokens")
+    else:
+        st.session_state.pdf_text = ""
+
+    st.markdown("---")
+
+    # ── Settings ───────────────────────────────────────────────────────────
+    st.markdown('<p class="panel-label">Settings</p>', unsafe_allow_html=True)
+    settings = st.session_state.settings
+
+    include_full = st.toggle(
+        "Send full PDF text (off = first 3 000 chars only)",
+        value=settings.get("include_full_text", True),
+    )
+    settings["include_full_text"] = include_full
+
+    model_name = st.text_input("Model name (as shown in LM Studio)", value=settings.get("model", "local-model"))
+    settings["model"] = model_name
+
+    if st.button("Save Settings"):
+        save_settings(settings)
+        st.session_state.settings = settings
+        st.success("Settings saved.")
+
+    st.markdown("---")
+
+    # ── Prompts ────────────────────────────────────────────────────────────
+    st.markdown('<p class="panel-label">Predefined Prompts</p>', unsafe_allow_html=True)
+    prompts = st.session_state.prompts
+
+    # Ensure we always have 5 slots
+    while len(prompts) < 5:
+        prompts.append("")
+
+    edited = []
+    for i, p in enumerate(prompts[:5]):
+        val = st.text_area(f"Prompt {i+1}", value=p, height=80, key=f"prompt_{i}")
+        edited.append(val)
+
+    col_s, col_r = st.columns(2)
+    with col_s:
+        if st.button("💾 Save Prompts"):
+            st.session_state.prompts = edited
+            save_prompts(edited)
+            st.success("Prompts saved!")
+    with col_r:
+        if st.button("↺ Reset to Defaults"):
+            st.session_state.prompts = DEFAULT_PROMPTS.copy()
+            save_prompts(DEFAULT_PROMPTS)
+            st.rerun()
+
+# ════════════════════════════ RIGHT PANEL ═══════════════════════════════════
+with right:
+    st.markdown('<p class="panel-label">Run a Prompt</p>', unsafe_allow_html=True)
+
+    active_prompts = [p for p in st.session_state.prompts if p.strip()]
+    if not active_prompts:
+        st.info("Add at least one prompt on the left to get started.")
+    else:
+        selected = st.selectbox(
+            "Choose a prompt",
+            options=active_prompts,
+            format_func=lambda x: x[:80] + "…" if len(x) > 80 else x,
+        )
+
+        custom_override = st.text_area(
+            "Or type / edit a prompt here (overrides selection if not empty)",
+            height=90,
+            placeholder="Leave blank to use the selected prompt above…",
+        )
+
+        final_prompt = custom_override.strip() or selected
+
+        st.markdown(f"> **Prompt to send:** {final_prompt[:120]}{'…' if len(final_prompt) > 120 else ''}")
+
+        if st.button("▶ Send to LLM", use_container_width=True):
+            if not st.session_state.pdf_text and not custom_override.strip():
+                st.warning("No PDF loaded and no custom prompt typed — the LLM will answer without document context.")
+            with st.spinner("Waiting for response…"):
+                try:
+                    resp = send_to_llm(
+                        final_prompt,
+                        st.session_state.pdf_text,
+                        model=settings.get("model", "local-model"),
+                        include_full_text=settings.get("include_full_text", True),
+                    )
+                    st.session_state.response = resp
+                except requests.exceptions.ConnectionError:
+                    st.session_state.response = "❌ Could not connect to the LLM server.\nMake sure LM Studio is running and the server is started."
+                except Exception as e:
+                    st.session_state.response = f"❌ Error: {e}"
+
+    st.markdown("---")
+    st.markdown('<p class="panel-label">Response</p>', unsafe_allow_html=True)
+
+    if st.session_state.response:
+        st.markdown(
+            f'<div class="response-box">{st.session_state.response}</div>',
+            unsafe_allow_html=True,
+        )
+        st.download_button(
+            "⬇ Download response",
+            data=st.session_state.response,
+            file_name="llm_response.txt",
+            mime="text/plain",
+        )
+        if st.button("🗑 Clear"):
+            st.session_state.response = ""
+            st.rerun()
+    else:
+        st.markdown('<div class="response-box" style="color:#334155;">Response will appear here…</div>', unsafe_allow_html=True)
