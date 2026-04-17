@@ -1,0 +1,4 @@
+{
+  "include_full_text": true,
+  "model": "google/gemma-4-e4b"
+}

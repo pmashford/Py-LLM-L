@@ -42,26 +42,38 @@ def save_settings(settings):
 
 def check_server():
     try:
-        result = subprocess.run(
-            ["lms", "server", "stat"],
-            capture_output=True, text=True, timeout=8,
-            shell=True  # needed on Windows
-        )
-        output = result.stdout + result.stderr
-        running = result.returncode == 0 and "running" in output.lower()
-        return running, output.strip() or "(no output)"
-    except FileNotFoundError:
-        return False, "`lms` command not found. Is LM Studio installed and on PATH?"
-    except subprocess.TimeoutExpired:
-        return False, "Command timed out."
+        # Check if the local API is responding
+        response = requests.get(f"{LMS_API_BASE}/models", timeout=2)
+        if response.status_code == 200:
+            return True, "Server is responding to API requests."
+        return False, f"Server returned status code {response.status_code}"
+    except requests.exceptions.ConnectionError:
+        return False, "Could not connect to LM Studio API. Is the server started?"
     except Exception as e:
         return False, str(e)
+# def check_server():
+#     try:
+#         result = subprocess.run(
+#             ["lms", "server", "start"],
+#             capture_output=True, text=True, timeout=8,
+#             shell=True  # needed on Windows
+#         )
+#         output = result.stdout + result.stderr
+#         running = result.returncode == 0 and "running" in output.lower()
+#         return running, output.strip() or "(no output)"
+#     except FileNotFoundError:
+#         return False, "`lms` command not found. Is LM Studio installed and on PATH?"
+#     except subprocess.TimeoutExpired:
+#         return False, "Command timed out."
+#     except Exception as e:
+#         return False, str(e)
 
 def extract_pdf_text(uploaded_file):
     try:
         import pypdf
         reader = pypdf.PdfReader(uploaded_file)
-        return "\n\n".join(page.extract_text() or "" for page in reader.pages)
+        text = "\n\n".join(page.extract_text() or "" for page in reader.pages)
+        return text, None
     except ImportError:
         return None, "pypdf not installed. Run: pip install pypdf"
     except Exception as e:
@@ -69,19 +81,23 @@ def extract_pdf_text(uploaded_file):
 
 def stream_from_llm(prompt, pdf_text, model, include_full_text):
     """Yields text chunks from the LLM via SSE streaming."""
-    system = "You are a helpful assistant that analyses documents."
+    # system = "You are a Document Cleaning and Structural Expert."   ### PAM EDIT - keep it simple with just a user prompt
     if include_full_text and pdf_text:
-        user_msg = f"Here is the document content:\n\n{pdf_text}\n\n---\n\n{prompt}"
+        # user_msg = f"Here is the document content:\n\n{pdf_text}\n\n---\n\n{prompt}"
+        user_msg = f"{prompt}\n\n### RAW TEXT TO PROCESS\n---\n{pdf_text}\n---"
     elif pdf_text:
         excerpt = pdf_text[:3000]
-        user_msg = f"Here is an excerpt from the document:\n\n{excerpt}\n\n---\n\n{prompt}"
+        # user_msg = f"Here is an excerpt from the document:\n\n{excerpt}\n\n---\n\n{prompt}"
+        user_msg = f"{prompt}\n\n### RAW TEXT EXCERPTTO PROCESS\n---\n{pdf_text}\n---"
     else:
         user_msg = prompt
+
+
 
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": system},
+            # {"role": "system", "content": system},    ### PAM EDIT - keep it simple with just a user prompt
             {"role": "user",   "content": user_msg},
         ],
         "stream": True,
@@ -114,7 +130,7 @@ def save_response_to_file(text, output_dir="responses"):
     """Saves response text to a timestamped .txt file. Returns the path."""
     os.makedirs(output_dir, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(output_dir, f"response_{ts}.txt")
+    path = os.path.join(output_dir, f"response_{ts}.html")
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
     return os.path.abspath(path)
@@ -216,22 +232,40 @@ left, right = st.columns([1, 1.6], gap="large")
 
 # ════════════════════════════ LEFT PANEL ════════════════════════════════════
 with left:
-    # ── Server Status ──────────────────────────────────────────────────────
-    st.markdown('<p class="panel-label">Server</p>', unsafe_allow_html=True)
-    col_btn, col_status = st.columns([1, 2])
-    with col_btn:
-        if st.button("Check Status"):
+    # ── Server Control ──────────────────────────────────────────────────────
+    st.markdown('<p class="panel-label">Server Control</p>', unsafe_allow_html=True)
+    col_check, col_start = st.columns(2)
+
+    with col_check:
+        if st.button("🔍 Check Status", use_container_width=True):
             with st.spinner("Checking..."):
                 ok, msg = check_server()
                 st.session_state.server_status = (ok, msg)
-    with col_status:
-        if st.session_state.server_status is not None:
-            ok, msg = st.session_state.server_status
-            label = "● ONLINE" if ok else "● OFFLINE"
-            cls   = "status-ok" if ok else "status-fail"
-            st.markdown(f'<span class="{cls}">{label}</span>', unsafe_allow_html=True)
-            with st.expander("Details"):
-                st.code(msg, language="")
+
+    with col_start:
+        if st.button("🚀 Start Server", use_container_width=True):
+            try:
+                # We use Popen so the app doesn't wait for the server to close
+                # 'shell=True' is usually needed for the 'lms' command on Windows
+                subprocess.Popen(
+                    ["lms", "server", "start"], 
+                    shell=True, 
+                    stdout=subprocess.DEVNULL, 
+                    stderr=subprocess.DEVNULL
+                )
+                st.toast("Attempting to start LM Studio server...")
+                st.session_state.server_status = (True, "Start command sent!")
+            except Exception as e:
+                st.error(f"Failed to start: {e}")
+
+    # Display Status Indicator
+    if st.session_state.server_status is not None:
+        ok, msg = st.session_state.server_status
+        label = "● ONLINE" if ok else "● OFFLINE"
+        cls = "status-ok" if ok else "status-fail"
+        st.markdown(f'<div style="text-align:center; margin-top:10px;"><span class="{cls}">{label}</span></div>', unsafe_allow_html=True)
+        with st.expander("Server Logs/Details"):
+            st.code(msg)
 
     st.markdown("---")
 
@@ -239,15 +273,16 @@ with left:
     st.markdown('<p class="panel-label">PDF Document</p>', unsafe_allow_html=True)
     uploaded = st.file_uploader("Select a PDF file", type=["pdf"], label_visibility="collapsed")
     if uploaded:
-        text = extract_pdf_text(uploaded)
-        if isinstance(text, tuple):          # error tuple
-            st.error(text[1])
-            st.session_state.pdf_text = ""
-        else:
-            st.session_state.pdf_text = text
-            st.success(f"Loaded **{uploaded.name}** — {len(text):,} chars / ~{len(text)//4:,} tokens")
-    else:
-        st.session_state.pdf_text = ""
+        # Only process if it's a new file (based on name or size)
+        if "last_uploaded" not in st.session_state or st.session_state.last_uploaded != uploaded.name:
+            text, err = extract_pdf_text(uploaded)
+            if err:
+                st.error(err)
+            else:
+                st.session_state.pdf_text = text
+                st.session_state.last_uploaded = uploaded.name
+                st.success(f"Loaded **{uploaded.name}**")
+    # Remove the 'else: pdf_text = ""' to persist text between reruns
 
     st.markdown("---")
 
@@ -363,9 +398,9 @@ with right:
         # ── Download (browser) ──────────────────────────────────────────────
         with c1:
             st.download_button(
-                "⬇ Download .txt",
+                "⬇ Download .htlm",
                 data=st.session_state.response,
-                file_name="llm_response.txt",
+                file_name="llm_response.html",
                 mime="text/plain",
                 use_container_width=True,
             )
@@ -375,26 +410,73 @@ with right:
             if st.button("💾 Save to file", use_container_width=True):
                 path = save_response_to_file(st.session_state.response)
                 st.success(f"Saved → `{path}`")
+# # ── Copy to clipboard ───────────────────────────────────────────────
+#         with c3:
+#             if st.session_state.response:
+#                 # json.dumps handles all special characters and wrapping in double quotes
+#                 js_content = json.dumps(st.session_state.response)
+                
+#                 # We use a single-quote f-string for the markdown to avoid breaking the HTML
+#                 st.markdown(
+#                     f'''
+#                     <button onclick='const text = {js_content}; navigator.clipboard.writeText(text).then(()=>{{
+#                         this.innerText="✅ Copied!";
+#                         setTimeout(()=>this.innerText="📋 Copy to clipboard", 2000);
+#                     }})'
+#                     style="width:100%; padding:10px; background:#1e40af; color:#e2e8f0; 
+#                            border:none; border-radius:6px; font-family:monospace; 
+#                            font-size:0.82rem; cursor:pointer;">
+#                         📋 Copy to clipboard
+#                     </button>
+#                     ''',
+#                     unsafe_allow_html=True
+#                 )
+#             else:
+#                 st.button("📋 Copy", disabled=True, use_container_width=True)
 
         # ── Copy to clipboard ───────────────────────────────────────────────
         with c3:
-            # Inject JS to copy to clipboard; escape backticks in the text
-            escaped = st.session_state.response.replace("\\", "\\\\").replace("`", "\\`")
-            st.markdown(
-                f"""
-                <button onclick="navigator.clipboard.writeText(`{escaped}`).then(()=>{{
-                    this.innerText='✅ Copied!';
-                    setTimeout(()=>this.innerText='📋 Copy to clipboard',2000);
-                }})"
-                style="width:100%;padding:0.45rem 0.8rem;background:#1e40af;color:#e2e8f0;
-                       border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;
-                       font-size:0.82rem;cursor:pointer;">
-                    📋 Copy to clipboard
-                </button>
-                """,
-                unsafe_allow_html=True,
-            )
-
+            if st.session_state.response:
+                # json.dumps handles all special characters and wrapping in double quotes
+                js_content = json.dumps(st.session_state.response)
+                
+                st.markdown(
+                    f'''
+                    <div style="width: 100%;">
+                        <button id="copy-btn" onclick='const text = {js_content}; navigator.clipboard.writeText(text).then(()=>{{
+                                const btn = document.getElementById("copy-btn");
+                                btn.innerText="✅ Copied!";
+                                btn.style.background="#4ade80";
+                                setTimeout(()=>{{
+                                    btn.innerText="📋 Copy";
+                                    btn.style.background="#1e40af";
+                                }}, 2000);
+                            }})'
+                            style="
+                                width: 100%;
+                                height: 38.4px; /* Matches standard Streamlit button height */
+                                background: #1e40af;
+                                color: #e2e8f0;
+                                border: none;
+                                border-radius: 6px;
+                                font-family: 'JetBrains Mono', monospace;
+                                font-size: 0.82rem;
+                                cursor: pointer;
+                                display: flex;
+                                align-items: center;
+                                justify-content: center;
+                                transition: background 0.2s;
+                            "
+                            onMouseOver="this.style.background='#2563eb'"
+                            onMouseOut="this.style.background='#1e40af'">
+                            📋 Copy
+                        </button>
+                    </div>
+                    ''',
+                    unsafe_allow_html=True
+                )
+            else:
+                st.button("📋 Copy", disabled=True, use_container_width=True)
         # ── Clear ───────────────────────────────────────────────────────────
         with c4:
             if st.button("🗑 Clear", use_container_width=True):
