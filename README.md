@@ -16,8 +16,12 @@ A Streamlit UI for sending predefined prompts to your local LLM (LM Studio).
 
 3. Run the app:
    ```
-   streamlit run app.py
+   uv run streamlit run app.py
    ```
+4. Cancel the app in the shell:
+   '''
+   ctrl + c
+   '''
 
 ## Features
 
